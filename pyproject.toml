@@ -8,12 +8,16 @@ version = "0.1.0"
 description = "잠깐제주 운영 도구"
 requires-python = ">=3.11"
 dependencies = [
+    "langchain>=1,<2",
     "langchain-core>=1,<2",
     "langchain-google-genai>=4,<5",
     "httpx>=0.28,<1",
     "pydantic>=2,<3",
     "python-dotenv>=1,<2",
 ]
+
+[project.scripts]
+jamkkanjeju = "jamkkanjeju_agent.chat:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
