@@ -10,11 +10,13 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.errors import GraphRecursionError
 
 from .agent import create_operations_agent
+from .snapshots import snapshot_store
 
-HELP = """자연어로 질문하세요. 예: 저장된 장소 5개 보여줘 / 다음 페이지도 보여줘
+HELP = """자연어로 질문하세요. 예: 삭제될 장소 뽑아줘 / 추가될 장소 비교해줘
 /help  도움말    /clear  대화 기록 초기화    /exit  종료
 exit 또는 quit, Ctrl+D(Windows는 Ctrl+Z 후 Enter)로도 종료할 수 있습니다.
-현재는 장소 조회만 가능하며, 대화는 현재 실행 중에만 유지됩니다."""
+장소 조회·비교와 점검 예약 도구를 제공합니다. 점검 예약에는 실행 중인 Spring 예약 API가 필요합니다.
+대화는 현재 실행 중에만 유지됩니다."""
 
 
 def print_progress(text: str) -> None:
@@ -27,7 +29,7 @@ def run_chat(agent, *, read: Callable[[str], str] = input, write: Callable[[str]
     turns: list[list[BaseMessage]] = []
 
     def display(text: str) -> None:
-        for name in ("GOOGLE_API_KEY", "AGENT_API_TOKEN"):
+        for name in ("GOOGLE_API_KEY", "AGENT_API_TOKEN", "KTO_SERVICE_KEY"):
             secret = os.getenv(name, "")
             if secret:
                 text = text.replace(secret, "[비밀 정보 제외]")
@@ -50,7 +52,8 @@ def run_chat(agent, *, read: Callable[[str], str] = input, write: Callable[[str]
             continue
         if prompt == "/clear":
             turns.clear()
-            display("대화 기록을 초기화했습니다.")
+            snapshot_store.clear()
+            display("대화 기록과 장소 스냅샷을 초기화했습니다.")
             continue
         if prompt.startswith("/"):
             display("알 수 없는 명령입니다. /help로 확인해 주세요.")

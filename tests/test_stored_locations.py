@@ -1,108 +1,97 @@
-"""모델·실제 DB 없이 Tool 스키마와 HTTP 연결·실패 처리를 검증한다."""
+"""전체 DB 조회·스냅샷 생성·실패 시 비생성을 HTTP 대역으로 검증한다."""
 
 import httpx
 import pytest
 from langchain_core.tools import ToolException
 from pydantic import ValidationError
 
-from jamkkanjeju_agent.tools.stored_locations import create_get_stored_locations
+from jamkkanjeju_agent.clients.stored_locations import StoredLocationClient, StoredLocationsError
+from jamkkanjeju_agent.snapshots import snapshot_store
+from jamkkanjeju_agent.tools import stored_locations as module
 
-URL = "https://spring.test/api/v2/agent/locations"
-TOKEN = "private-test-token"
-LOCATION = {
-    "locationId": 1, "contentId": 2853982, "title": "라토커피제주",
-    "address": "제주시", "category": "음식", "radius": 100,
-    "latitude": 33.4987305369, "longitude": 126.5281672061,
-}
+LOCATION = {"locationId":1,"contentId":2853982,"title":"라토커피제주","address":"제주시",
+            "category":"음식","radius":100,"latitude":33.5,"longitude":126.5}
 
 
-def make_tool(handler, **settings):
-    return create_get_stored_locations(
-        api_url=settings.get("api_url", URL), agent_token=settings.get("agent_token", TOKEN),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+def page(rows, number=0, has_next=False):
+    return {"locations":rows,"locationsPage":{"page":number,"size":100,"hasNext":has_next}}
 
 
-def test_calls_get_with_auth_and_preserves_page_and_location_data():
+def client_read(handler):
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        return StoredLocationClient(http).get_locations()
+
+
+def test_all_pages_are_collected_without_exposing_locations_to_llm(monkeypatch):
+    requests=[]
     def handler(request):
-        assert request.method == "GET"
-        assert request.headers["X-Agent-Token"] == TOKEN
+        requests.append(request)
+        assert request.headers["X-Agent-Token"] == "private-test-token"
         assert "Authorization" not in request.headers
-        assert dict(request.url.params) == {"page": "2", "size": "10"}
-        return httpx.Response(200, json={"locations": [LOCATION], "locationsPage": {"page": 2, "size": 10, "hasNext": True}})
-
-    result = make_tool(handler).invoke({"page": 2, "size": 10})
-    assert result == {"locations": [LOCATION], "locationsPage": {"page": 2, "size": 10, "hasNext": True}}
-    assert TOKEN not in str(result)
-
-
-def test_empty_page_is_a_valid_result():
-    result = make_tool(lambda _: httpx.Response(200, json={"locations": [], "locationsPage": {"page": 0, "size": 100, "hasNext": False}})).invoke({})
-    assert result["locations"] == []
-    assert result["locationsPage"]["hasNext"] is False
-
-
-@pytest.mark.parametrize("input", [{"page": -1}, {"size": 0}, {"size": 101}, {"page": "1"}, {"page": True}, {"agent_token": "not-an-input"}])
-def test_invalid_model_input_never_makes_a_request(input):
-    def handler(_):
-        pytest.fail("잘못된 입력으로 서버를 호출하면 안 됩니다.")
-    with pytest.raises(ValidationError):
-        make_tool(handler).invoke(input)
+        number=int(request.url.params["page"])
+        assert request.url.params["size"]=="100"
+        rows=[{**LOCATION,"locationId":i,"contentId":i} for i in range(1,101)] if number==0 else [{**LOCATION,"locationId":101,"contentId":101}]
+        return httpx.Response(200,json=page(rows,number,number==0))
+    real_client=httpx.Client
+    monkeypatch.setattr(module.httpx,"Client",lambda:real_client(transport=httpx.MockTransport(handler)))
+    result=module.get_stored_locations.invoke({})
+    assert result["count"]==101 and result["source"]=="DB"
+    assert "locations" not in result
+    assert len(snapshot_store.get(result["snapshotId"],"DB").locations)==101
+    assert [r.url.params["page"] for r in requests]==["0","1"]
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 500, 302])
-def test_http_failure_is_not_an_empty_success_or_secret_leak(status):
-    def handler(_):
-        return httpx.Response(status, json={"message": TOKEN}, headers={"Location": "https://other.test"})
-    with pytest.raises(ToolException) as error:
-        make_tool(handler).invoke({})
-    assert TOKEN not in str(error.value)
+def test_empty_db_is_a_successful_complete_snapshot(monkeypatch):
+    monkeypatch.setattr(StoredLocationClient,"get_locations",lambda self:[])
+    result=module.get_stored_locations.invoke({})
+    assert result["status"]=="COMPLETE" and result["count"]==0
 
 
-@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadTimeout])
-def test_transport_failure_is_explicit(failure):
+@pytest.mark.parametrize("data", [{}, page([{**LOCATION,"latitude":200}]),page([LOCATION],number=1),
+                                  page([LOCATION],has_next=True),page([LOCATION,LOCATION])])
+def test_invalid_response_never_becomes_complete(data):
+    with pytest.raises(StoredLocationsError):
+        client_read(lambda _:httpx.Response(200,json=data))
+
+
+@pytest.mark.parametrize("status", [401,403,404,500,302])
+def test_http_failure_does_not_leak_body_or_token(status):
+    with pytest.raises(StoredLocationsError) as error:
+        client_read(lambda _:httpx.Response(status,text="private-test-token"))
+    assert "private-test-token" not in str(error.value)
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout,httpx.ConnectError])
+def test_transport_failure_is_not_empty(error_type):
     def handler(request):
-        raise failure("private-detail", request=request)
-    with pytest.raises(ToolException) as error:
-        make_tool(handler).invoke({})
-    assert "private-detail" not in str(error.value)
+        raise error_type("private-network-detail",request=request)
+    with pytest.raises(StoredLocationsError) as error:
+        client_read(handler)
+    assert "private-network-detail" not in str(error.value)
 
 
-@pytest.mark.parametrize("data", [
-    {}, {"locations": [LOCATION], "locationsPage": {"page": 1, "size": 100, "hasNext": False}},
-    {"locations": [{**LOCATION, "latitude": 200}], "locationsPage": {"page": 0, "size": 100, "hasNext": False}},
-])
-def test_invalid_response_does_not_become_success(data):
-    with pytest.raises(ToolException):
-        make_tool(lambda _: httpx.Response(200, json=data)).invoke({})
-
-
-def test_non_json_response_fails():
-    with pytest.raises(ToolException):
-        make_tool(lambda _: httpx.Response(200, text="not JSON")).invoke({})
-
-
-@pytest.mark.parametrize("settings", [{"api_url": ""}, {"api_url": "file:///local"}, {"agent_token": ""}])
-def test_missing_settings_fail_before_network(settings):
-    def handler(_):
-        pytest.fail("설정이 없으면 서버를 호출하면 안 됩니다.")
-    with pytest.raises(ToolException):
-        make_tool(handler, **settings).invoke({})
-
-
-def test_only_page_and_size_are_exposed_to_the_model():
-    tool = make_tool(lambda _: httpx.Response(500))
-    assert tool.name == "get_stored_locations"
-    assert set(tool.args) == {"page", "size"}
-    assert "읽기 전용" in tool.description
-
-
-def test_reads_fixed_token_from_environment(monkeypatch):
-    monkeypatch.setenv("STORED_LOCATIONS_API_URL", URL)
-    monkeypatch.setenv("AGENT_API_TOKEN", TOKEN)
+def test_late_page_failure_publishes_no_snapshot(monkeypatch):
+    save=[]
     def handler(request):
-        assert request.headers["X-Agent-Token"] == TOKEN
-        assert "Authorization" not in request.headers
-        return httpx.Response(200, json={"locations": [], "locationsPage": {"page": 0, "size": 100, "hasNext": False}})
-    tool = create_get_stored_locations(client=httpx.Client(transport=httpx.MockTransport(handler)))
-    assert tool.invoke({})["locations"] == []
+        if request.url.params["page"]=="0":
+            return httpx.Response(200,json=page([{**LOCATION,"locationId":i,"contentId":i} for i in range(1,101)],has_next=True))
+        return httpx.Response(500)
+    real_client=httpx.Client
+    monkeypatch.setattr(module.httpx,"Client",lambda:real_client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(snapshot_store,"save_complete",lambda *args:save.append(args))
+    with pytest.raises(ToolException):
+        module.get_stored_locations.invoke({})
+    assert save==[]
+
+
+def test_tool_schema_does_not_expose_page_raw_data_or_credentials():
+    assert module.get_stored_locations.args == {}
+    assert module.get_stored_locations.args_schema.model_json_schema()["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("setting,value",[("STORED_LOCATIONS_API_URL",""),("STORED_LOCATIONS_API_URL","file:///local"),("AGENT_API_TOKEN","")])
+def test_invalid_config_fails_before_network(monkeypatch,setting,value):
+    monkeypatch.setenv(setting,value)
+    with httpx.Client() as http:
+        with pytest.raises(StoredLocationsError):
+            StoredLocationClient(http)
