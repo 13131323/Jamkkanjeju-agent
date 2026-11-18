@@ -3,7 +3,7 @@
 
 ## 현재 구현 범위
 
-자연어로 대화하는 `jamkkanjeju` CLI와 LangChain 에이전트를 구현했습니다. 저장 장소 조회(`get_stored_locations`), TourAPI 전체 조회(`get_tourapi_locations`), 스냅샷 비교(`compare_locations`), 개별 존재 확인(`get_tourapi_location`), 점검 예약 등록 요청(`schedule_maintenance`) 도구를 제공합니다. 점검 예약은 실행 중인 Spring 예약 API에 등록하며, 장소 데이터 동기화 적용은 아직 구현하지 않았습니다.
+자연어로 대화하는 `jamkkanjeju` CLI와 LangChain 에이전트를 구현했습니다. 저장 장소 조회(`get_stored_locations`), TourAPI 전체 조회(`get_tourapi_locations`), 스냅샷 비교(`compare_locations`), 개별 존재 확인(`get_tourapi_location`), 점검 예약 등록 요청(`schedule_maintenance`) 도구를 제공합니다. 점검 예약은 실행 중인 Spring 예약 API에 등록하며, `synchronize_locations`는 비교에서 발급한 planId의 추가·삭제 목록을 표시하고 실제 사용자의 y/n 승인을 한 번 받은 뒤 Spring 동기화 API를 호출합니다.
 
 이 도구는 Python에서 Spring의 `GET /api/v2/agent/locations`를 호출해 실제 DB의 장소를 ID순으로 조회합니다. 사용자 로그인 JWT 대신 에이전트 전용 고정 토큰을 `X-Agent-Token` 헤더로 전달합니다. 토큰은 일반 사용자 API에 대한 권한을 주지 않습니다.
 
@@ -119,7 +119,7 @@ DB·TourAPI 전체 조회 Tool은 입력 없이 마지막 페이지까지 수집
 
 `httpx.MockTransport`로 HTTP 요청과 응답을 검증합니다. 실제 DB나 LLM은 호출하지 않습니다.
 
-구현 파일: `src/jamkkanjeju_agent/tools/stored_locations.py`.
+구현 파일: `src/jamkkanjeju_agent/tools/location_tools.py`.
 
 참고: [LangChain 공식 Tools 문서](https://docs.langchain.com/oss/python/langchain/tools).
 
@@ -190,11 +190,11 @@ result = compare_locations.invoke({
 - 두 API는 DB 트랜잭션 스냅샷이 아닙니다. 실제 삭제 작업을 구현할 때에는 점검 중 쓰기 차단 및 적용 직전 재검증이 필요합니다.
 
 
-TourAPI 연동은 `clients/tourapi.py`의 `TourApiClient`가 담당합니다.
+TourAPI 연동은 `clients/tourapi_client.py`의 `TourApiClient`가 담당합니다.
 TourAPI 전체 조회 Tool은 `TourApiClient(http_client).get_locations()`를 호출해 메모리 스냅샷을 저장합니다.
 클라이언트가 환경변수 인증 설정, HTTP 요청·재시도, 전체 페이지 수집 및 응답 검증을 처리하고,
 Tool이 클라이언트 오류를 `ToolException`으로 변환하여 집합 비교를 차단합니다.
-`httpx.Client`는 호출자가 `with`로 생성·종료하며, `TourApiClient` 생성만으로는 API를 호출하지 않습니다.
+CLI는 `client_scope()`로 대화 전체의 연결 수명을 관리합니다. 각 서비스의 첫 호출 때 클라이언트를 한 번 만들고 이후 Tool에서 재사용하며, CLI 종료 시 HTTP 연결을 닫습니다. `TourApiClient` 생성만으로는 API를 호출하지 않습니다.
 
 
 ## 점검 예약 Tool (Spring API 연동 준비)
@@ -269,7 +269,7 @@ CLI에서 “오늘 오후 3시 27분에 점검 예약해 줘”라고 요청하
 
 ## 스냅샷 기반 Tool 분리 검증
 
-원본 목록은 `snapshots.py`의 프로세스 메모리에만 보관하며 입력·출력 사본을 분리해 외부 수정이 비교 원본을 바꾸지 않게 합니다.
+원본 목록은 `memory/store.py`의 프로세스 메모리에만 보관하며 입력·출력 사본을 분리해 외부 수정이 비교 원본을 바꾸지 않게 합니다.
 누락·오류가 있는 수집에서는 새 스냅샷을 발급하지 않습니다. 비교 Tool에는 ID만 전달하며 임의 장소 배열을 입력할 수 없습니다.
 기존 create_get_stored_locations 팩토리·단일 페이지 Tool과 비교 Tool 내부의 전체 수집 코드는 제거했습니다.
 
@@ -277,3 +277,51 @@ CLI에서 “오늘 오후 3시 27분에 점검 예약해 줘”라고 요청하
 실제 모델의 도구 선택은 API 한도 때문에 실험하지 않았으며, ScriptedModel과 실제 LangChain 그래프로 세 Tool의 순서·ID 전달·오류 중단을 검증합니다.
 
 스냅샷 분리 후 관련 테스트 126개 통과. 실제 외부 HTTP 전송을 차단한 상태에서 검증했으며 유료·무료 모델 API 토큰을 사용하지 않았습니다. 변경 적용에는 실행 중인 CLI를 종료한 뒤 다시 시작해야 합니다.
+
+## 승인 후 장소 동기화
+
+`장소를 비교해서 동기화해 줘`처럼 실행을 요청하면 DB·TourAPI 조회와 비교를 거쳐 `synchronize_locations`를 사용할 수 있다. 조회 → 비교에서 고정된 planId 생성 → 동기화 Tool이 해당 결과 보고와 단일 (y/n) 확인을 수행한다. 동기화 Tool의 재비교나 LLM의 별도 실행 허가 질문은 없다. y이면 Spring API를 호출하고 n이면 취소한다.
+
+Spring 동기화 API 코드도 구현했으며 서버 재빌드 시 V6 마이그레이션을 적용해야 한다. 호출 예정 계약·인증·트랜잭션 및 멱등성 요구사항은 [LOCATION_SYNC_API.md](docs/LOCATION_SYNC_API.md)에 정리했다. `.env`의 `LOCATION_SYNC_API_URL`과 기존 `AGENT_API_TOKEN`을 사용한다. 이 프로젝트에서 SQL이나 실제 DB 변경을 실행하지 않는다.
+
+
+## 코드 구조와 클라이언트 공유
+
+```text
+src/jamkkanjeju_agent/
+├── __main__.py                 # LLM 없는 DB 조회 진단 진입점
+├── agent.py                    # 에이전트 구성·프롬프트
+├── chat.py                     # jamkkanjeju CLI·사용자 승인
+├── tools/
+│   ├── location_tools.py       # 장소 조회·비교·동기화 Tool
+│   ├── maintenance_tools.py    # 기존 점검 예약 Tool
+│   ├── mission_tools.py        # 추후 미션 Tool 추가 위치
+│   └── review_tools.py         # 추후 후기 Tool 추가 위치
+├── clients/
+│   ├── __init__.py             # 공유 인스턴스와 연결 수명 관리
+│   ├── spring_client.py        # DB 조회·점검 예약·동기화 API
+│   ├── tourapi_client.py       # TourAPI 전체·상세 조회
+│   └── gemini.py               # 기존 LLM 객체 생성
+├── services/
+│   ├── location_comparison.py  # 집합 비교·삭제 후보 상세 확인
+│   └── sync_approval.py        # 실제 CLI 승인 전달
+└── memory/
+    └── store.py               # 스냅샷·동기화 계획
+```
+
+장소 조회·점검 예약·동기화 Tool은 모두 동일한 `SpringClient`를 공유합니다.
+TourAPI Tool과 비교 서비스의 상세 재확인도 동일한 `TourApiClient`를 사용합니다.
+서비스별 클라이언트는 필요할 때 생성하므로 DB 조회만 할 때 TourAPI 설정은 필요하지 않습니다.
+기존 환경변수 이름과 HTTP 계약은 유지합니다.
+
+Python에서 Tool을 직접 호출할 때도 연결 수명을 명시하려면 다음처럼 사용합니다.
+
+```python
+from jamkkanjeju_agent.clients import client_scope
+from jamkkanjeju_agent.tools import get_stored_locations
+
+with client_scope():
+    result = get_stored_locations.invoke({})
+```
+
+스냅샷·계획은 실행 중 메모리에만 남습니다. 이번 구조 변경으로 DB·Redis 영속 저장이 추가되지는 않았습니다.

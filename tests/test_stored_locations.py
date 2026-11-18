@@ -1,13 +1,16 @@
 """전체 DB 조회·스냅샷 생성·실패 시 비생성을 HTTP 대역으로 검증한다."""
 
+import jamkkanjeju_agent.clients as client_runtime
+
+
 import httpx
 import pytest
 from langchain_core.tools import ToolException
 from pydantic import ValidationError
 
-from jamkkanjeju_agent.clients.stored_locations import StoredLocationClient, StoredLocationsError
-from jamkkanjeju_agent.snapshots import snapshot_store
-from jamkkanjeju_agent.tools import stored_locations as module
+from jamkkanjeju_agent.clients.spring_client import SpringClient, StoredLocationsError
+from jamkkanjeju_agent.memory.store import snapshot_store
+from jamkkanjeju_agent.tools import location_tools as module
 
 LOCATION = {"locationId":1,"contentId":2853982,"title":"라토커피제주","address":"제주시",
             "category":"음식","radius":100,"latitude":33.5,"longitude":126.5}
@@ -19,7 +22,7 @@ def page(rows, number=0, has_next=False):
 
 def client_read(handler):
     with httpx.Client(transport=httpx.MockTransport(handler)) as http:
-        return StoredLocationClient(http).get_locations()
+        return SpringClient(http).get_stored_locations()
 
 
 def test_all_pages_are_collected_without_exposing_locations_to_llm(monkeypatch):
@@ -33,7 +36,7 @@ def test_all_pages_are_collected_without_exposing_locations_to_llm(monkeypatch):
         rows=[{**LOCATION,"locationId":i,"contentId":i} for i in range(1,101)] if number==0 else [{**LOCATION,"locationId":101,"contentId":101}]
         return httpx.Response(200,json=page(rows,number,number==0))
     real_client=httpx.Client
-    monkeypatch.setattr(module.httpx,"Client",lambda:real_client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(client_runtime.httpx,"Client",lambda:real_client(transport=httpx.MockTransport(handler)))
     result=module.get_stored_locations.invoke({})
     assert result["count"]==101 and result["source"]=="DB"
     assert "locations" not in result
@@ -42,7 +45,7 @@ def test_all_pages_are_collected_without_exposing_locations_to_llm(monkeypatch):
 
 
 def test_empty_db_is_a_successful_complete_snapshot(monkeypatch):
-    monkeypatch.setattr(StoredLocationClient,"get_locations",lambda self:[])
+    monkeypatch.setattr(SpringClient,"get_stored_locations",lambda self:[])
     result=module.get_stored_locations.invoke({})
     assert result["status"]=="COMPLETE" and result["count"]==0
 
@@ -77,7 +80,7 @@ def test_late_page_failure_publishes_no_snapshot(monkeypatch):
             return httpx.Response(200,json=page([{**LOCATION,"locationId":i,"contentId":i} for i in range(1,101)],has_next=True))
         return httpx.Response(500)
     real_client=httpx.Client
-    monkeypatch.setattr(module.httpx,"Client",lambda:real_client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(client_runtime.httpx,"Client",lambda:real_client(transport=httpx.MockTransport(handler)))
     monkeypatch.setattr(snapshot_store,"save_complete",lambda *args:save.append(args))
     with pytest.raises(ToolException):
         module.get_stored_locations.invoke({})
@@ -94,4 +97,4 @@ def test_invalid_config_fails_before_network(monkeypatch,setting,value):
     monkeypatch.setenv(setting,value)
     with httpx.Client() as http:
         with pytest.raises(StoredLocationsError):
-            StoredLocationClient(http)
+            SpringClient(http).get_stored_locations()

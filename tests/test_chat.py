@@ -1,5 +1,8 @@
 """대화 명령과 실제 LangChain 그래프의 도구 실행·기록 관리를 외부 모델 없이 검증한다."""
 
+import jamkkanjeju_agent.clients as client_runtime
+
+
 import json
 from collections.abc import Sequence
 
@@ -14,12 +17,12 @@ from jamkkanjeju_agent.agent import create_operations_agent
 from jamkkanjeju_agent import agent as agent_module
 from jamkkanjeju_agent.chat import run_chat
 from types import SimpleNamespace
-from jamkkanjeju_agent.clients.stored_locations import StoredLocationClient, StoredLocationsError
-from jamkkanjeju_agent.clients.tourapi import TourApiClient
-from jamkkanjeju_agent.snapshots import snapshot_store
-from jamkkanjeju_agent import snapshots as snapshots_module
+from jamkkanjeju_agent.clients.spring_client import SpringClient, StoredLocationsError
+from jamkkanjeju_agent.clients.tourapi_client import TourApiClient
+from jamkkanjeju_agent.memory.store import snapshot_store
+from jamkkanjeju_agent.memory import store as snapshots_module
 from jamkkanjeju_agent.tools import get_stored_locations
-from jamkkanjeju_agent.tools import maintenance as maintenance_tool
+from jamkkanjeju_agent.tools import maintenance_tools as maintenance_tool
 
 
 class ScriptedModel(BaseChatModel):
@@ -50,6 +53,96 @@ def interact(agent, prompts):
     return code, output
 
 
+@pytest.mark.parametrize("decision,post_count", [("y", 1), ("n", 0)])
+def test_cli_real_input_is_required_before_sync_post(monkeypatch, decision, post_count):
+    from jamkkanjeju_agent.tools import synchronize_locations
+
+    def row(content_id):
+        return {"contentId": content_id, "title": f"동기화 장소 {content_id}", "address": "제주시",
+                "category": "음식", "radius": 100, "latitude": 33.5, "longitude": 126.5}
+    db = snapshot_store.save_complete("DB", [{**row(1), "locationId": 11}])
+    tour = snapshot_store.save_complete("TOURAPI", [row(2)])
+    monkeypatch.setattr(TourApiClient, "get_location", lambda self, content_id: None)
+    from jamkkanjeju_agent.tools.location_tools import compare_locations
+    compared = compare_locations.invoke({"storedSnapshotId": db["snapshotId"], "tourapiSnapshotId": tour["snapshotId"], "resultType": "all"})
+    args = {"planId": compared["planId"]}
+    calls = []
+    original = httpx.Client
+    def handler(request):
+        calls.append(request)
+        plan = json.loads(request.content)
+        return httpx.Response(200, json={"requestId": plan["requestId"], "status": "COMPLETED",
+                "addedCount": 1, "deletedCount": 1, "addedContentIds": [2], "deletedContentIds": [1]})
+    monkeypatch.setattr(client_runtime.httpx, "Client", lambda: original(transport=httpx.MockTransport(handler)))
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{"name": "synchronize_locations", "args": args, "id": "sync"}]),
+        AIMessage(content="실행 결과를 확인했습니다."),
+    ])
+    _, output = interact(create_operations_agent(model=model, tools=[synchronize_locations]),
+                         ["장소를 동기화해 줘", decision, "/exit"])
+    assert len(calls) == post_count
+    assert any("[장소 동기화 실행 전 확인]" in line for line in output)
+    assert any('[추가]' in line and '동기화 장소 2' in line for line in output)
+    assert any('[삭제]' in line and '동기화 장소 1' in line for line in output)
+    result = next(message for message in model.seen[1] if isinstance(message, ToolMessage))
+    assert json.loads(result.content)["status"] == ("COMPLETED" if post_count else "CANCELLED")
+
+
+def test_sync_full_flow_compares_once_then_reports_and_accepts_one_yes_no_stage(monkeypatch):
+    calls = []
+    monkeypatch.setattr(snapshots_module, "uuid4", lambda: SimpleNamespace(hex="a" * 32))
+    def row(content_id):
+        return {"contentId": content_id, "title": f"장소 {content_id}", "address": "제주시",
+                "category": "음식", "radius": 100, "latitude": 33.5, "longitude": 126.5}
+    def db(self):
+        calls.append("DB")
+        return [{**row(1), "locationId": 11}]
+    def tour(self):
+        calls.append("TOURAPI")
+        return [row(2)]
+    def detail(self, content_id):
+        calls.append("DETAIL")
+        return None
+    def execute(self, plan):
+        calls.append("SPRING")
+        return {"requestId": plan["requestId"], "status": "COMPLETED", "addedCount": 1,
+                "deletedCount": 1, "addedContentIds": [2], "deletedContentIds": [1]}
+    monkeypatch.setattr(SpringClient, "get_stored_locations", db)
+    monkeypatch.setattr(TourApiClient, "get_locations", tour)
+    monkeypatch.setattr(TourApiClient, "get_location", detail)
+    monkeypatch.setattr(SpringClient, "synchronize_locations", execute)
+    model = ScriptedModel(responses=[
+        AIMessage(content="", tool_calls=[{"name": "get_stored_locations", "args": {}, "id": "db"}]),
+        AIMessage(content="", tool_calls=[{"name": "get_tourapi_locations", "args": {}, "id": "tour"}]),
+        AIMessage(content="", tool_calls=[{"name": "compare_locations", "args": {
+            "storedSnapshotId": "db-" + "a" * 32, "tourapiSnapshotId": "tourapi-" + "a" * 32, "resultType": "all"}, "id": "compare"}]),
+        AIMessage(content="", tool_calls=[{"name": "synchronize_locations", "args": {"planId": "sync-plan-" + "a" * 32}, "id": "sync"}]),
+        AIMessage(content="동기화 완료"),
+    ])
+    prompts = []
+    inputs = iter(["장소 동기화해줘", "y", "/exit"])
+    output = []
+    def read(prompt):
+        prompts.append(prompt)
+        return next(inputs)
+    run_chat(create_operations_agent(model=model), read=read, write=output.append)
+    assert calls == ["DB", "TOURAPI", "DETAIL", "SPRING"]
+    assert len([prompt for prompt in prompts if "(y/n)" in prompt]) == 1
+    assert any('[추가]' in line for line in output) and any('[삭제]' in line for line in output)
+
+
+def test_invalid_approval_input_is_reprompted_instead_of_cancelling(monkeypatch):
+    from jamkkanjeju_agent.services.sync_approval import request_sync_approval
+    class ApprovalAgent:
+        def stream(self, *args, **kwargs):
+            approved = request_sync_approval({"requestId": "test", "addLocations": [],
+                "deleteLocations": [], "deletedLocationsReport": [], "impact": "영향"})
+            assert approved is True
+            yield {"model": {"messages": [AIMessage(content="완료")]}}
+    _, output = interact(ApprovalAgent(), ["동기화해줘", "승이", " Y ", "/exit"])
+    assert sum("y 또는 n" in line for line in output) == 1
+
+
 def test_model_receives_fresh_kst_date_for_relative_time_on_every_turn(monkeypatch):
     times = iter(["2026-11-17T15:20:00+09:00", "2026-11-18T00:01:00+09:00"])
     monkeypatch.setattr(agent_module, "current_kst_time", lambda: next(times))
@@ -75,7 +168,7 @@ def test_default_agent_routes_schedule_tool_and_reports_real_result(monkeypatch,
         return httpx.Response(status, json=result if status == 201 else {"message": "not implemented"})
 
     http = httpx.Client(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr(maintenance_tool.httpx, "Client", lambda: http)
+    monkeypatch.setattr(client_runtime.httpx, "Client", lambda: http)
     model = ScriptedModel(responses=[
         AIMessage(content="", tool_calls=[{"name": "schedule_maintenance", "args": {}, "id": "schedule"}]),
         AIMessage(content="예약 등록을 확인했습니다." if status == 201 else "예약 API가 아직 제공되지 않습니다."),
@@ -106,7 +199,7 @@ def test_agent_calls_db_then_tourapi_then_snapshot_comparison(monkeypatch):
     def detail(self,content_id):
         calls.append("DETAIL")
         return None
-    monkeypatch.setattr(StoredLocationClient,"get_locations",db)
+    monkeypatch.setattr(SpringClient,"get_stored_locations",db)
     monkeypatch.setattr(TourApiClient,"get_locations",tour)
     monkeypatch.setattr(TourApiClient,"get_location",detail)
     model=ScriptedModel(responses=[
@@ -133,7 +226,7 @@ def test_agent_calls_db_then_tourapi_then_snapshot_comparison(monkeypatch):
 def test_tool_failure_is_reported_and_no_snapshot_comparison_is_called(monkeypatch):
     def fail_collection(self):
         raise StoredLocationsError("Spring 서버 연결 실패")
-    monkeypatch.setattr(StoredLocationClient,"get_locations",fail_collection)
+    monkeypatch.setattr(SpringClient,"get_stored_locations",fail_collection)
     monkeypatch.setattr(TourApiClient,"get_locations",lambda self:pytest.fail("DB 실패 후 TourAPI 조회 금지"))
     model=ScriptedModel(responses=[
         AIMessage(content="",tool_calls=[{"name":"get_stored_locations","args":{},"id":"failed"}]),

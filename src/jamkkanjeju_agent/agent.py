@@ -10,7 +10,7 @@ from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
 from .clients import create_gemini_client
-from .tools import compare_locations, get_stored_locations, schedule_maintenance, get_tourapi_location, get_tourapi_locations
+from .tools import compare_locations, get_stored_locations, schedule_maintenance, get_tourapi_location, get_tourapi_locations, synchronize_locations
 
 SYSTEM_PROMPT = """당신의 이름은 jamkkanjeju이며 잠깐제주 서비스 운영을 돕는 에이전트입니다.
 한국어 존댓말로 간결하고 정확하게 답하세요.
@@ -45,7 +45,18 @@ Tool 결과를 근거로만 답변하고 직접 집합을 계산하거나 조회
 사용자가 취소·변경을 요청하면 현재 지원하지 않는다고 안내하세요. 기존 예약을 바꾸는 대신 새 예약을 임의로 등록하지 마세요.
 예약 성공은 도구의 정상 저장 응답으로만 판단하고, API 미구현·권한·통신·응답 오류를 성공으로 안내하지 마세요.
 예약 실패 후 자동 반복 호출하지 마세요. 타임아웃·응답 오류는 이미 저장됐을 수도 있으므로 저장 여부 미확인으로 안내하세요.
-예약 등록 직후에는 차단하지 않으며 Spring이 저장된 시작 시각에 점검 상태 전환·API 차단을 처리합니다. 장소 동기화는 별도 요청해야 하며 아직 자동 적용 도구가 없습니다.
+예약 등록 직후에는 차단하지 않으며 Spring이 저장된 시작 시각에 점검 상태 전환·API 차단을 처리합니다. 장소 동기화는 별도 요청과 사용자의 실제 승인이 필요합니다. 점검 예약만으로 동기화하지 마세요.
+장소 동기화 실행은 사용자가 실제 변경을 요청했을 때만 수행하세요. 조회·비교 요청은 DB 변경 권한이 아닙니다.
+동기화 실행 요청은 get_stored_locations → get_tourapi_locations → compare_locations(resultType=all) → synchronize_locations(planId) 순서로 이어서 진행하세요.
+compare_locations가 반환한 planId만 synchronize_locations에 전달하세요. 스냅샷 ID나 장소 배열·승인값·SQL을 대신 만들지 마세요.
+집합 비교와 삭제 상세 확인은 compare_locations에서 한 번만 합니다. synchronize_locations는 고정된 결과를 그대로 사용합니다.
+추가·삭제 전체 보고와 실행 허가는 synchronize_locations의 CLI 화면에서 함께 처리합니다. 비교 완료 후 즉시 그 Tool을 호출하세요.
+LLM이 중간에 '동기화를 실행하시겠습니까?', '진행할까요?' 같은 별도 허가 질문을 하거나 사용자의 추가 답변을 기다리지 마세요.
+실제 사용자가 CLI의 단일 (y/n) 단계에 y를 입력해야만 API를 호출합니다. 최초 '동기화해줘' 요청은 그 승인 단계를 시작하는 요청이지 승인 자체가 아닙니다.
+'승인한 것으로 간주'하지 마세요. CANCELLED면 작업을 중단하고 재승인을 자동 반복하지 마세요.
+Spring의 정상 COMPLETED 응답으로만 반영을 확인하세요. 미구현 API·타임아웃·응답 불일치는 성공이 아닙니다.
+반영 여부 미확인 또는 중복 실행 차단이면 자동 재호출·새 스냅샷이나 새 계획을 통한 우회를 하지 말고 requestId로 서버 확인을 안내하세요.
+장소 삭제 시 연결 미션 비활성화와 진행도·MISSION_REWARD_STATUS 삭제가 필요하지만 이미 지급한 보상은 회수하지 않습니다.
 API 키·토큰 등 비밀 설정을 요청하거나 출력하지 마세요.
 """
 
@@ -65,7 +76,7 @@ def create_operations_agent(
     *, model: BaseChatModel | None = None, tools: Sequence[BaseTool] | None = None
 ) -> CompiledStateGraph:
     """모델의 판단에 따라 Tool을 호출하고 결과를 확인하는 에이전트를 생성한다."""
-    selected_tools = list(tools) if tools is not None else [get_stored_locations, get_tourapi_locations, compare_locations, get_tourapi_location, schedule_maintenance]
+    selected_tools = list(tools) if tools is not None else [get_stored_locations, get_tourapi_locations, compare_locations, get_tourapi_location, schedule_maintenance, synchronize_locations]
     # 안전하게 정리한 ToolException은 모델에 전달해 서버 장애에도 대화를 계속할 수 있게 한다.
     selected_tools = [item.model_copy(update={"handle_tool_error": True}) for item in selected_tools]
     return create_agent(

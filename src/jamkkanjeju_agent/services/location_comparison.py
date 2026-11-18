@@ -1,31 +1,15 @@
-"""완료된 DB·TourAPI 스냅샷을 비교하고 삭제 검토 후보를 개별 재확인한다."""
+"""완료된 스냅샷 비교와 삭제 후보의 TourAPI 상세 재확인."""
 
-from typing import Literal
+from langchain_core.tools import ToolException
 
-import httpx
-from langchain_core.tools import ToolException, tool
-from pydantic import BaseModel, ConfigDict, Field
-
-from ..clients.tourapi import TourApiClient, TourApiError
-from ..snapshots import snapshot_store
+from ..clients import AgentClients
+from ..clients.tourapi_client import TourApiError
+from ..memory.store import snapshot_store, sync_plan_store
 
 
-class ComparisonInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    storedSnapshotId: str = Field(strict=True, min_length=1, max_length=80, description="get_stored_locations가 반환한 DB snapshotId")
-    tourapiSnapshotId: str = Field(strict=True, min_length=1, max_length=80, description="get_tourapi_locations가 반환한 TOURAPI snapshotId")
-    resultType: Literal["all", "additions", "deletions"] = Field(default="all", description="원하는 결과 범위. 삭제 대상 질문은 deletions, 추가 대상 질문은 additions, 전체 비교는 all")
-
-
-@tool("compare_locations", args_schema=ComparisonInput)
-def compare_locations(storedSnapshotId: str, tourapiSnapshotId: str, resultType: str = "all") -> dict:
-    """조회 Tool에서 받은 두 스냅샷 ID로 contentId 교집합·추가·삭제 검토 대상을 계산한다.
-
-    DB·TourAPI 목록을 새로 조회하지 않는다. 실제로 발급된 서로 다른 출처의 스냅샷만 사용할 수 있다.
-    삭제 검토는 DB에만 있는 장소를 detailCommon2로 재확인하며, 오류 시 비교 결과를 반환하지 않는다.
-    confirmedMissingLocations는 상세 API에서도 정상 0건인 장소이며 폐업을 단정하지 않는다.
-    existingOutsideListLocations는 상세에 존재하므로 삭제 후보에서 제외한다. 실제 DB를 변경하지 않는다.
-    """
+def compare_location_snapshots(storedSnapshotId: str, tourapiSnapshotId: str,
+                               resultType: str, clients: AgentClients) -> dict:
+    """스냅샷만 비교하고 목록 차집합의 삭제 후보는 상세 조회로 확인한다."""
     stored_snapshot = snapshot_store.get(storedSnapshotId, "DB")
     tourapi_snapshot = snapshot_store.get(tourapiSnapshotId, "TOURAPI")
     stored = {row["contentId"]: row for row in stored_snapshot.locations}
@@ -36,9 +20,7 @@ def compare_locations(storedSnapshotId: str, tourapiSnapshotId: str, resultType:
     verified = {}
     if resultType in {"all", "deletions"} and missing_ids:
         try:
-            with httpx.Client() as http:
-                client = TourApiClient(http)
-                verified = {content_id: client.get_location(content_id) for content_id in missing_ids}
+            verified = {content_id: clients.tourapi.get_location(content_id) for content_id in missing_ids}
         except TourApiError as exc:
             raise ToolException(f"{exc} 개별 확인에 실패하여 비교 결과를 반환하지 않았습니다.") from None
 
@@ -60,4 +42,7 @@ def compare_locations(storedSnapshotId: str, tourapiSnapshotId: str, resultType:
             for i in missing_ids if verified[i] is not None
         ]
         result["missingLocationsMeaning"] = "missingLocations는 목록 차집합일 뿐 삭제 확정 아님. confirmedMissingLocations만 개별 상세 조회에서도 정상 0건으로 확인됨. existingOutsideListLocations는 존재하므로 삭제 후보 아님."
+    if resultType == "all":
+        result["planId"] = sync_plan_store.save(storedSnapshotId, tourapiSnapshotId,
+                                               result["addedLocations"], result["confirmedMissingLocations"])
     return result

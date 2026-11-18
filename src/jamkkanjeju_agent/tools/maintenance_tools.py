@@ -1,11 +1,11 @@
 """공지 문구를 받아 Spring에 점검 예약을 등록하는 LangChain Tool."""
 
-import httpx
 from datetime import datetime
 from langchain_core.tools import ToolException, tool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ..clients.maintenance import MaintenanceApiError, MaintenanceClient
+from ..clients import get_clients
+from ..clients.spring_client import MaintenanceApiError
 
 
 DEFAULT_MAINTENANCE_MESSAGE = "장소 데이터 동기화를 위한 서비스 점검이 예정되어 있습니다. 점검 시간 동안 서비스 이용이 제한됩니다."
@@ -58,8 +58,7 @@ def schedule_maintenance(message: str = DEFAULT_MAINTENANCE_MESSAGE, startsAt: s
     저장 여부가 불명확한 실패에서는 중복 예약을 막기 위해 이 Tool을 자동 반복 호출하지 않는다.
     """
     try:
-        with httpx.Client() as http:
-            reservation = MaintenanceClient(http).schedule(message, startsAt=startsAt)
+        reservation = get_clients().spring.schedule_maintenance(message, startsAt=startsAt)
     except MaintenanceApiError as exc:
         raise ToolException(str(exc)) from None
     return reservation.model_dump(mode="json")

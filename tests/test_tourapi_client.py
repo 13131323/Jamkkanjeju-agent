@@ -3,7 +3,7 @@
 import httpx
 import pytest
 
-from jamkkanjeju_agent.clients import tourapi as module
+from jamkkanjeju_agent.clients import tourapi_client as module
 
 
 def item(content_id=1, category="FD", **updates):
@@ -98,8 +98,6 @@ def test_late_page_failure_and_count_drift(monkeypatch):
             collect(handler)
 
 
-
-
 def test_constructor_does_not_call_api_or_close_injected_http_client():
     def unexpected_request(request):
         pytest.fail("객체 생성만으로 API를 호출하면 안 됩니다.")
@@ -182,7 +180,7 @@ def test_detail_error_or_mismatched_content_id_is_never_absence(payload):
 
 @pytest.mark.parametrize("exists", [True, False])
 def test_individual_tool_reports_only_client_verified_existence(monkeypatch, exists):
-    from jamkkanjeju_agent.tools.tourapi_location import get_tourapi_location
+    from jamkkanjeju_agent.tools.location_tools import get_tourapi_location
     detail = {"contentId":2861967,"title":"장모식탁"} if exists else None
     monkeypatch.setattr(module.TourApiClient, "get_location", lambda self, content_id: detail)
     result = get_tourapi_location.invoke({"contentId":2861967})
@@ -193,6 +191,6 @@ def test_individual_tool_reports_only_client_verified_existence(monkeypatch, exi
 @pytest.mark.parametrize("content_id", [0, -1, "2861967", True])
 def test_individual_tool_rejects_invalid_content_id(content_id):
     from pydantic import ValidationError
-    from jamkkanjeju_agent.tools.tourapi_location import get_tourapi_location
+    from jamkkanjeju_agent.tools.location_tools import get_tourapi_location
     with pytest.raises(ValidationError):
         get_tourapi_location.invoke({"contentId":content_id})

@@ -1,5 +1,8 @@
 """미구현 Spring API 대신 HTTP 대역으로 예약 Tool과 클라이언트를 검증한다."""
 
+import jamkkanjeju_agent.clients as client_runtime
+
+
 import json
 
 import httpx
@@ -7,8 +10,8 @@ import pytest
 from langchain_core.tools import ToolException
 from pydantic import ValidationError
 
-from jamkkanjeju_agent.clients.maintenance import MaintenanceApiError, MaintenanceClient
-from jamkkanjeju_agent.tools import maintenance as module
+from jamkkanjeju_agent.clients.spring_client import MaintenanceApiError, SpringClient
+from jamkkanjeju_agent.tools import maintenance_tools as module
 
 
 URL = "https://spring.test/api/v2/agent/maintenances"
@@ -30,7 +33,7 @@ def environment(monkeypatch):
 
 def install_http(monkeypatch, handler):
     http = httpx.Client(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr(module.httpx, "Client", lambda: http)
+    monkeypatch.setattr(client_runtime.httpx, "Client", lambda: http)
     return http
 
 
@@ -50,6 +53,8 @@ def test_tool_sends_default_message_and_returns_confirmed_reservation(monkeypatc
     http = install_http(monkeypatch, handler)
     assert module.schedule_maintenance.invoke(args) == RESPONSE
     assert len(calls) == 1
+    assert not http.is_closed
+    client_runtime.close_default_clients()
     assert http.is_closed
 
 
@@ -63,7 +68,7 @@ def test_custom_message_is_trimmed_and_sent_without_client_side_times(monkeypatc
 
 @pytest.mark.parametrize("args", [{"message": "가" * 501}, {"message": 123}, {"endsAt": "2026-11-18T03:00:00"}, {"agent_token": TOKEN}])
 def test_invalid_input_never_creates_http_client(monkeypatch, args):
-    monkeypatch.setattr(module.httpx, "Client", lambda: pytest.fail("입력 검증 전 호출 금지"))
+    monkeypatch.setattr(client_runtime.httpx, "Client", lambda: pytest.fail("입력 검증 전 호출 금지"))
     with pytest.raises(ValidationError):
         module.schedule_maintenance.invoke(args)
 
@@ -90,7 +95,7 @@ def test_optional_start_time_is_forwarded_only_when_present(monkeypatch, start):
 @pytest.mark.parametrize("start", ["오늘 오후 3시", "2026-02-30T15:27:00", "2026-11-17T25:00:00",
                                    "2026-11-17T15:27:00+09:00", "2026-11-17", 123])
 def test_invalid_start_time_never_sends_post(monkeypatch, start):
-    monkeypatch.setattr(module.httpx, "Client", lambda: pytest.fail("잘못된 시각으로 예약 금지"))
+    monkeypatch.setattr(client_runtime.httpx, "Client", lambda: pytest.fail("잘못된 시각으로 예약 금지"))
     with pytest.raises(ValidationError):
         module.schedule_maintenance.invoke({"startsAt": start})
 
@@ -146,4 +151,4 @@ def test_invalid_settings_fail_before_request(monkeypatch, setting, value):
     monkeypatch.setenv(setting, value)
     with httpx.Client(transport=httpx.MockTransport(lambda _: pytest.fail("설정 오류로 요청 금지"))) as http:
         with pytest.raises(MaintenanceApiError):
-            MaintenanceClient(http)
+            SpringClient(http).schedule_maintenance("공지")

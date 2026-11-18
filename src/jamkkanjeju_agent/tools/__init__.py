@@ -1,7 +1,8 @@
-from .stored_locations import get_stored_locations
-from .location_comparison import compare_locations
-from .maintenance import schedule_maintenance
-from .tourapi_location import get_tourapi_location
-from .tourapi_locations import get_tourapi_locations
+from .location_tools import (
+    compare_locations, get_stored_locations, get_tourapi_location,
+    get_tourapi_locations, synchronize_locations,
+)
+from .maintenance_tools import schedule_maintenance
 
-__all__ = ["get_stored_locations", "compare_locations", "schedule_maintenance", "get_tourapi_location", "get_tourapi_locations"]
+__all__ = ["synchronize_locations", "get_stored_locations", "compare_locations",
+           "schedule_maintenance", "get_tourapi_location", "get_tourapi_locations"]

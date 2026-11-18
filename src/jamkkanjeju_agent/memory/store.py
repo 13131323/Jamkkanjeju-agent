@@ -74,3 +74,50 @@ class LocationSnapshotStore:
 
 
 snapshot_store = LocationSnapshotStore()
+
+
+@dataclass(frozen=True)
+class LocationSyncPlan:
+    plan_id: str
+    request_id: str
+    stored_snapshot_id: str
+    tourapi_snapshot_id: str
+    additions: tuple[dict, ...]
+    deletions: tuple[dict, ...]
+
+
+class LocationSyncPlanStore:
+    """LLM에는 계획 ID만 전달하며 원본과 실행 측 사본의 변경을 분리한다."""
+
+    def __init__(self):
+        self._plans: dict[str, LocationSyncPlan] = {}
+        self._lock = Lock()
+
+    def save(self, stored_snapshot_id: str, tourapi_snapshot_id: str,
+             additions: list[dict], deletions: list[dict]) -> str:
+        """삭제 상세 확인까지 끝난 전체 비교 결과만 실행 계획으로 고정한다."""
+        plan = LocationSyncPlan(f"sync-plan-{uuid4().hex}", f"location-sync-{uuid4().hex}",
+                                stored_snapshot_id, tourapi_snapshot_id,
+                                tuple(deepcopy(additions)), tuple(deepcopy(deletions)))
+        with self._lock:
+            self._plans[plan.plan_id] = plan
+        return plan.plan_id
+
+    def get(self, plan_id: str) -> LocationSyncPlan:
+        """계획과 원본 스냅샷이 현재 실행에 남아 있는지 확인하고 사본을 반환한다."""
+        with self._lock:
+            plan = self._plans.get(plan_id)
+            if plan is None:
+                raise ToolException("해당 동기화 계획이 없습니다. 전체 조회와 비교를 먼저 진행해 주세요.")
+            plan = deepcopy(plan)
+        snapshot_store.get(plan.stored_snapshot_id, "DB")
+        snapshot_store.get(plan.tourapi_snapshot_id, "TOURAPI")
+        return plan
+
+    def clear(self) -> None:
+        """대화 초기화·종료 시 계획도 재사용할 수 없게 한다."""
+        with self._lock:
+            self._plans.clear()
+
+
+sync_plan_store = LocationSyncPlanStore()

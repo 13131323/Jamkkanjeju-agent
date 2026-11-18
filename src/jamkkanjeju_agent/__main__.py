@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from langchain_core.tools import ToolException
 
 from .tools import get_stored_locations
+from .clients import client_scope
 
 
 def main() -> int:
@@ -15,7 +16,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="저장된 장소 조회 Tool 단독 실행")
     parser.parse_args()
     try:
-        result = get_stored_locations.invoke({})
+        with client_scope():
+            result = get_stored_locations.invoke({})
     except ToolException as error:
         print(str(error), file=sys.stderr)
         return 1
