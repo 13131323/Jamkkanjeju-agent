@@ -21,7 +21,7 @@ class ScheduleMaintenanceInput(BaseModel):
     )
     startsAt: str | None = Field(
         default=None, strict=True, pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$",
-        description="사용자가 지정한 점검 시작 시각. 한국시간 YYYY-MM-DDTHH:mm:ss, offset 없음. 지정하지 않았으면 생략하면 서버 현재 시각 1시간 뒤로 예약한다.",
+        description="사용자가 지정한 점검 시작 시각. 한국시간 YYYY-MM-DDTHH:mm:ss, offset 없음. 미래 시각에는 최소 대기 시간 제한이 없으며 1~2분 뒤도 가능하다. 생략 시에만 서버 현재 시각 1시간 뒤를 기본값으로 사용한다.",
     )
 
     @field_validator("startsAt")
@@ -49,7 +49,11 @@ def schedule_maintenance(message: str = DEFAULT_MAINTENANCE_MESSAGE, startsAt: s
 
     message는 선택 공지 문구다. 생략하면 장소 데이터 동기화 기본 공지를 사용한다.
     startsAt은 사용자가 지정한 한국시간 YYYY-MM-DDTHH:mm:ss다. 생략하면 서버 현재 시각 1시간 뒤 시작한다.
+    1시간은 생략 시 기본값이며 최소 예약 간격이 아니다. 미래 시각에는 최소 대기 시간 제한이 없다.
+    1~2분 뒤라도 임박했다는 이유로 거절하지 말고 지정한 시각으로 호출한다.
+    과거이거나 해석이 불명확한 시각은 사용자에게 확인하며 임의로 시각을 변경하지 않는다.
     Spring이 시작 시각 1시간 뒤를 종료 예정으로 계산해 SCHEDULED 데이터를 저장한다.
+    이 Tool은 신규 예약 등록 전용이다. 기존 예약을 조회·취소·변경하지 않으며 그런 기능을 안내하지 않는다.
     서버 응답으로 확인한 예약만 반환한다. 점검 시작·API 차단·장소 동기화를 직접 실행하지 않는다.
     저장 여부가 불명확한 실패에서는 중복 예약을 막기 위해 이 Tool을 자동 반복 호출하지 않는다.
     """
