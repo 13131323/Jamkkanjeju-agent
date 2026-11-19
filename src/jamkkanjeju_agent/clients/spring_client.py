@@ -34,6 +34,21 @@ class StoredLocationsResponse(BaseModel):
     locationsPage: LocationsPage
 
 
+class GuestbooksError(RuntimeError):
+    """방명록 조회의 인증 정보와 원문을 제외한 오류."""
+
+
+class GuestbookText(BaseModel):
+    locationId: int = Field(strict=True, gt=0)
+    guestbookId: int = Field(strict=True, gt=0)
+    text: str | None = Field(strict=True)
+
+
+class GuestbooksResponse(BaseModel):
+    guestbooks: list[GuestbookText]
+    guestbooksPage: LocationsPage
+
+
 class MaintenanceApiError(RuntimeError):
     """인증 정보와 외부 오류 원문을 제외한 점검 예약 연동 오류."""
 
@@ -155,6 +170,71 @@ class SpringClient:
                 return locations
             page += 1
 
+
+    def get_location_guestbooks(self) -> list[dict]:
+        """방명록 전체를 읽고 페이지 누락·중복·역순을 거부한다."""
+        default = self._endpoint("STORED_LOCATIONS_API_URL", GuestbooksError).rsplit("/", 1)[0] + "/guestbooks"
+        url = self._endpoint("GUESTBOOKS_API_URL", GuestbooksError, default)
+        rows, page, previous = [], 0, 0
+        while True:
+            try:
+                response = self._http.get(url, params={"page": page, "size": 100},
+                    headers={"X-Agent-Token": self._token, "Accept": "application/json"},
+                    timeout=httpx.Timeout(30.0, connect=5.0), follow_redirects=False)
+            except httpx.RequestError:
+                raise GuestbooksError("방명록 조회 연결에 실패했습니다. 분석 스냅샷을 생성하지 않았습니다.") from None
+            if not response.is_success:
+                raise GuestbooksError(f"방명록 조회 API 오류(HTTP {response.status_code}). 분석 스냅샷을 생성하지 않았습니다.")
+            try:
+                result = GuestbooksResponse.model_validate_json(response.content)
+            except ValueError:
+                raise GuestbooksError("방명록 조회 응답 형식이 올바르지 않습니다.") from None
+            info = result.guestbooksPage
+            if (info.page != page or info.size != 100 or len(result.guestbooks) > 100
+                    or (info.hasNext and len(result.guestbooks) != 100)
+                    or (page > 0 and not result.guestbooks)):
+                raise GuestbooksError("방명록 페이지가 누락되었거나 불완전합니다.")
+            for item in result.guestbooks:
+                if item.guestbookId <= previous:
+                    raise GuestbooksError("방명록 ID 중복 또는 정렬 오류입니다.")
+                previous = item.guestbookId
+                rows.append(item.model_dump())
+            if not info.hasNext:
+                return rows
+            page += 1
+
+    def get_guestbook_texts(self, guestbook_ids: list[int]) -> list[dict]:
+        """선택 ID만 100개씩 조회한다. 실패·계약 불일치는 부분 성공으로 반환하지 않는다."""
+        if not guestbook_ids or any(type(value) is not int or value <= 0 for value in guestbook_ids):
+            raise GuestbooksError("조회할 방명록 ID는 하나 이상의 양수 정수여야 합니다.")
+        ids = list(dict.fromkeys(guestbook_ids))
+        default = self._endpoint("STORED_LOCATIONS_API_URL", GuestbooksError).rsplit("/", 1)[0] + "/guestbooks"
+        url = self._endpoint("GUESTBOOKS_API_URL", GuestbooksError, default)
+        rows = []
+        for start in range(0, len(ids), 100):
+            batch = ids[start:start + 100]
+            try:
+                response = self._http.get(url, params={"page": 0, "size": 100,
+                    "guestbookIds": ",".join(map(str, batch))},
+                    headers={"X-Agent-Token": self._token, "Accept": "application/json"},
+                    timeout=httpx.Timeout(30.0, connect=5.0), follow_redirects=False)
+            except httpx.RequestError:
+                raise GuestbooksError("방명록 원문 조회 연결에 실패했습니다. 부분 결과를 반환하지 않습니다.") from None
+            if not response.is_success:
+                raise GuestbooksError(f"방명록 원문 조회 API 오류(HTTP {response.status_code}). 부분 결과를 반환하지 않습니다.")
+            try:
+                result = GuestbooksResponse.model_validate_json(response.content)
+            except ValueError:
+                raise GuestbooksError("방명록 원문 조회 응답 형식이 올바르지 않습니다.") from None
+            page = result.guestbooksPage
+            returned_ids = [item.guestbookId for item in result.guestbooks]
+            if (page.page != 0 or page.size != 100 or page.hasNext
+                    or len(returned_ids) != len(set(returned_ids))
+                    or not set(returned_ids).issubset(batch)
+                    or returned_ids != sorted(returned_ids)):
+                raise GuestbooksError("방명록 원문 조회 응답이 요청 ID 또는 페이지 계약과 다릅니다.")
+            rows.extend(item.model_dump() for item in result.guestbooks)
+        return rows
 
     def schedule_maintenance(self, message: str, *, startsAt: str | None = None) -> MaintenanceReservation:
         """예약 등록 POST는 중복 생성을 피하기 위해 자동 재시도하지 않는다."""

@@ -21,6 +21,7 @@ jamkkanjeju = "jamkkanjeju_agent.chat:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
+sentiment = ["torch>=2.6,<3", "transformers>=4.57,<5", "safetensors>=0.4,<1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,4 +1,4 @@
-"""전체 조회가 성공한 장소 목록을 현재 프로세스의 메모리에 보관한다."""
+"""장소 스냅샷·동기화 계획·방명록 분석 결과를 프로세스 메모리에 보관한다."""
 
 from copy import deepcopy
 from dataclasses import dataclass
@@ -121,3 +121,34 @@ class LocationSyncPlanStore:
 
 
 sync_plan_store = LocationSyncPlanStore()
+
+
+class GuestbookAnalysisStore:
+    """완료된 분석만 저장하며 반환 사본을 원본과 분리한다."""
+
+    def __init__(self):
+        self._items = {}
+        self._lock = Lock()
+
+    def save(self, locations: list[dict]) -> dict:
+        fields = ("locationId", "locationName", "positive", "negative", "unknown",
+                  "positiveCount", "negativeCount", "unknownCount", "totalCount", "negativeRatio")
+        result = {"snapshotId": "guestbook-analysis-" + str(uuid4()),
+                  "createdAt": datetime.now(timezone(timedelta(hours=9))).isoformat(timespec="seconds"),
+                  "locations": [{key: deepcopy(row[key]) for key in fields} for row in locations]}
+        with self._lock:
+            self._items[result["snapshotId"]] = result
+        return deepcopy(result)
+
+    def get(self, snapshot_id: str) -> dict:
+        with self._lock:
+            if snapshot_id not in self._items:
+                raise ToolException("방명록 분석 스냅샷이 없습니다. 다시 분석해 주세요.")
+            return deepcopy(self._items[snapshot_id])
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+
+
+analysis_store = GuestbookAnalysisStore()

@@ -325,3 +325,25 @@ with client_scope():
 ```
 
 스냅샷·계획은 실행 중 메모리에만 남습니다. 이번 구조 변경으로 DB·Redis 영속 저장이 추가되지는 않았습니다.
+
+## 한국어 감성 분류 모델 단독 실행
+
+`services/sentiment_classifier.py`의 `KoreanSentimentClassifier`는 공개 모델 `daekeun-ml/koelectra-small-v3-nsmc`를 로컬 CPU에서 실행한다. 아직 LangChain Tool·Spring 방명록 API·장소 집계에는 연결하지 않았다.
+
+감성 분석을 사용할 때만 선택 의존성을 설치한다. CPU 환경에서는 PyTorch 공식 CPU 패키지를 먼저 설치할 수 있다.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install "torch>=2.6,<3" --index-url https://download.pytorch.org/whl/cpu
+.\.venv\Scripts\python.exe -m pip install -e ".[sentiment]"
+.\.venv\Scripts\python.exe -X utf8 tests/manual_sentiment_model.py
+```
+
+- 최초 분석 시 모델 파일 약 56.5MB와 토크나이저를 Hugging Face에서 내려받는다. 이후 로컬 캐시와 같은 객체의 모델을 재사용한다. 일반 에이전트 CLI 실행만으로는 모델을 불러오지 않는다.
+- 공개 모델이므로 Gemini·OpenAI API 키는 필요하지 않다. 텍스트 추론은 로컬에서 실행하며 문장을 외부 LLM에 전송하지 않는다.
+- 모델 리비전은 `d1c0233fc013ae8bd879d7b61f2bec69aa3af4c9`로 고정했다. 모델 카드의 클래스 순서에 따라 0=NEGATIVE, 1=POSITIVE로 변환한다. `config.id2label`은 숫자만 있으므로 문자열을 추측해서 해석하지 않는다.
+- `classify(["좋았어요", None, " "])`는 입력 순서대로 결과를 반환한다. 텍스트 없음·공백만 UNKNOWN/score=None이며, 텍스트가 있으면 점수 임계값 없이 POSITIVE 또는 NEGATIVE로 분류한다. score는 선택한 클래스의 softmax 점수이며 실제 정확도를 보장하는 수치가 아니다.
+- 기본 배치는 16개이며 한 글은 최대 512토큰까지 사용한다. 더 긴 글은 잘리므로 추후 실제 방명록 Tool에서는 긴 글 처리 방식을 별도 결정해야 한다.
+- 실제 5문장 테스트는 수동 실행 파일이라 기본 pytest에 포함되지 않는다. 일반 단위 테스트는 `python -m pytest tests/test_sentiment_classifier.py -q`이며 모델 다운로드 없이 동작한다.
+
+## 장소 방명록 분석
+`analyze_location_guestbooks`는 ACTIVE 장소 방명록을 로컬 감성 모델로 분류합니다. sentiment 선택 의존성을 설치해야 합니다. 모든 장소에 대해 positive/negative/unknown ID 배열, 각각 건수, totalCount와 negativeRatio(미확인 포함 전체 대비 부정 비율, 0~1)를 반환합니다. 방명록 없는 장소는 비율 null입니다. 원문과 모델 점수는 보관하지 않습니다. 메모리 스냅샷은 /clear 또는 CLI 종료 시 삭제합니다. 원문 조회·보고서 Tool은 아직 구현하지 않았습니다.

@@ -11,14 +11,15 @@ from langgraph.errors import GraphRecursionError
 
 from .agent import create_operations_agent
 from .clients import client_scope
-from .memory.store import snapshot_store
+from .clients.gemini import describe_gemini_error
+from .memory.store import snapshot_store, analysis_store
 from .services.sync_approval import approval_scope
 from .tools.location_tools import clear_sync_executions
 
 HELP = """자연어로 질문하세요. 예: 삭제될 장소 뽑아줘 / 추가될 장소 비교해줘
 /help  도움말    /clear  대화 기록 초기화    /exit  종료
 exit 또는 quit, Ctrl+D(Windows는 Ctrl+Z 후 Enter)로도 종료할 수 있습니다.
-장소 조회·비교, 사용자 승인 후 동기화와 점검 예약 도구를 제공합니다. 점검 예약에는 실행 중인 Spring 예약 API가 필요합니다.
+장소 방명록 감성 분석, 장소 조회·비교, 사용자 승인 후 동기화와 점검 예약 도구를 제공합니다. 점검 예약에는 실행 중인 Spring 예약 API가 필요합니다.
 대화는 현재 실행 중에만 유지됩니다."""
 
 
@@ -30,7 +31,10 @@ def print_progress(text: str) -> None:
 def run_chat(agent, *, read: Callable[[str], str] = input, write: Callable[[str], None] = print_progress) -> int:
     """대화 중 서비스별 연결을 공유하고 종료·오류 시 정리한다."""
     with client_scope():
-        return _run_chat(agent, read=read, write=write)
+        try:
+            return _run_chat(agent, read=read, write=write)
+        finally:
+            analysis_store.clear()
 
 
 def _run_chat(agent, *, read: Callable[[str], str] = input, write: Callable[[str], None] = print_progress) -> int:
@@ -82,6 +86,7 @@ def _run_chat(agent, *, read: Callable[[str], str] = input, write: Callable[[str
         if prompt == "/clear":
             turns.clear()
             snapshot_store.clear()
+            analysis_store.clear()
             clear_sync_executions()
             display("대화 기록·장소 스냅샷·동기화 계획을 초기화했습니다.")
             continue
@@ -128,7 +133,8 @@ def _run_chat(agent, *, read: Callable[[str], str] = input, write: Callable[[str
             display("처리 단계 한도에 도달했습니다. 요청 범위를 줄여 다시 시도해 주세요.")
         except Exception as error:
             # 외부 SDK 예외 원문에는 URL·인증 정보가 섞일 수 있으므로 그대로 출력하지 않는다.
-            display(f"요청 처리에 실패했습니다({type(error).__name__}). 연결 상태·모델 설정·API 한도를 확인해 주세요.")
+            diagnosis = describe_gemini_error(error)
+            display(diagnosis or f"요청 처리에 실패했습니다({type(error).__name__}). 연결 상태·모델 설정·API 한도를 확인해 주세요.")
 
 
 def main() -> int:
